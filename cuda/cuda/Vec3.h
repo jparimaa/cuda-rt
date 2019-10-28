@@ -158,4 +158,17 @@ __host__ __device__ inline Vec3 normalize(Vec3 v)
     return v / v.length();
 }
 
+__host__ __device__ inline Vec3 squareRoot(Vec3 v)
+{
+    return Vec3(sqrt(v[0]),
+                sqrt(v[1]),
+                sqrt(v[2]));
+}
+
+__host__ __device__ inline Vec3 clampMax(Vec3 v, float f)
+{
+    return Vec3(v[0] > f ? f : v[0],
+                v[1] > f ? f : v[1],
+                v[2] > f ? f : v[2]);
+}
 #endif

@@ -12,12 +12,13 @@
 #include <stb_image_write.h>
 
 #include <iostream>
+#include <chrono>
 
 const int c_width = 800;
 const int c_height = 400;
 const int c_numPixels = c_width * c_height;
 const size_t c_framebufferSize = 3 * c_numPixels * sizeof(uint8_t);
-const int c_numRaysPerPixel = 1;
+const int c_numRaysPerPixel = 100;
 
 #define checkCudaErrors(val) checkCuda((val), #val, __FILE__, __LINE__)
 void checkCuda(cudaError_t result, char const* const func, const char* const file, int const line)
@@ -42,7 +43,7 @@ __device__ Vec3 randomInUnitSphere(curandState* localRandomState)
     return p;
 }
 
-__device__ Vec3 color(const Ray& r, Hitable** d_scene /*, curandState* localRandomState*/)
+__device__ Vec3 color(const Ray& r, Hitable** d_scene, curandState* localRandomState)
 {
     Ray currentRay = r;
     float currentAttenuation = 1.0f;
@@ -52,7 +53,7 @@ __device__ Vec3 color(const Ray& r, Hitable** d_scene /*, curandState* localRand
         Hit hit;
         if ((*d_scene)->hit(currentRay, 0.001f, FLT_MAX, hit))
         {
-            Vec3 target = hit.p + hit.normal /* + randomInUnitSphere(localRandomState)*/;
+            Vec3 target = hit.p + hit.normal + randomInUnitSphere(localRandomState);
             currentAttenuation *= 0.5f;
             currentRay = Ray(hit.p, target - hit.p);
         }
@@ -75,27 +76,30 @@ __global__ void render(uint8_t* framebuffer, int width, int height, int numRays,
     {
         return;
     }
-    int pixelIndex = j * width * 3 + i * 3;
 
-    //curandState localRandomState = d_randomState[pixelIndex];
+    int randomStatePixelIndex = j * width + i;
+    curandState localRandomState = d_randomState[randomStatePixelIndex];
     Vec3 c(0, 0, 0);
 
     for (int s = 0; s < numRays; ++s)
     {
-        float u = static_cast<float>(i /*+ curand_uniform(&localRandomState)*/) / static_cast<float>(width);
-        float v = static_cast<float>(j /*+ curand_uniform(&localRandomState)*/) / static_cast<float>(height);
+        float u = static_cast<float>(i + curand_uniform(&localRandomState)) / static_cast<float>(width);
+        float v = static_cast<float>(j + curand_uniform(&localRandomState)) / static_cast<float>(height);
         Ray r = (*d_camera)->getRay(u, v);
-        c += color(r, d_scene /*, &localRandomState*/);
+        c += color(r, d_scene, &localRandomState);
     }
 
-    //d_randomState[pixelIndex] = localRandomState;
+    c /= static_cast<float>(numRays);
+    c = squareRoot(c); // gamma fix
+    c = clampMax(c, 1.0f);
 
-    framebuffer[pixelIndex + 0] = static_cast<uint8_t>(c.r() * 255);
-    framebuffer[pixelIndex + 1] = static_cast<uint8_t>(c.g() * 255);
-    framebuffer[pixelIndex + 2] = static_cast<uint8_t>(c.b() * 255);
+    int framebufferPixelIndex = j * width * 3 + i * 3;
+    framebuffer[framebufferPixelIndex + 0] = static_cast<uint8_t>(c.r() * 255.99f);
+    framebuffer[framebufferPixelIndex + 1] = static_cast<uint8_t>(c.g() * 255.99f);
+    framebuffer[framebufferPixelIndex + 2] = static_cast<uint8_t>(c.b() * 255.99f);
 }
 
-__global__ void initRender(int width, int height, curandState* randomState)
+__global__ void initRandomState(int width, int height, curandState* d_randomState)
 {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     int j = threadIdx.y + blockIdx.y * blockDim.y;
@@ -104,7 +108,7 @@ __global__ void initRender(int width, int height, curandState* randomState)
         return;
     }
     int pixelIndex = j * width + i;
-    curand_init(1984, pixelIndex, 0, &randomState[pixelIndex]);
+    curand_init(1984, pixelIndex, 0, &d_randomState[pixelIndex]);
 }
 
 __global__ void createScene(Hitable** d_spheres, Hitable** d_scene, Camera** d_camera)
@@ -125,6 +129,8 @@ __global__ void freeScene(Hitable** d_spheres, Hitable** d_scene, Camera** d_cam
 
 int main()
 {
+    std::cout << "Started..." << std::endl;
+
     curandState* d_randomState;
     checkCudaErrors(cudaMalloc((void**)&d_randomState, c_numPixels * sizeof(curandState)));
 
@@ -147,13 +153,27 @@ int main()
     dim3 blocks(c_width / tx + 1, c_height / ty + 1);
     dim3 threads(tx, ty);
 
-    //initRender<<<blocks, threads>>>(c_width, c_height, d_randomState);
-    checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaDeviceSynchronize());
+    {
+        std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
 
-    render<<<blocks, threads>>>(framebuffer, c_width, c_height, c_numRaysPerPixel, d_camera, d_scene, d_randomState);
-    checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaDeviceSynchronize());
+        initRandomState<<<blocks, threads>>>(c_width, c_height, d_randomState);
+        checkCudaErrors(cudaGetLastError());
+        checkCudaErrors(cudaDeviceSynchronize());
+
+        std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
+        std::cout << "Random state initialized (" << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << " ms)" << std::endl;
+    }
+
+    {
+        std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+
+        render<<<blocks, threads>>>(framebuffer, c_width, c_height, c_numRaysPerPixel, d_camera, d_scene, d_randomState);
+        checkCudaErrors(cudaGetLastError());
+        checkCudaErrors(cudaDeviceSynchronize());
+
+        std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
+        std::cout << "Rendering completed (" << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << " ms)" << std::endl;
+    }
 
     std::string fileName = "output.png";
     stbi_write_png(fileName.c_str(), c_width, c_height, 3, (void*)framebuffer, 0);
@@ -165,8 +185,9 @@ int main()
     checkCudaErrors(cudaFree(d_camera));
     checkCudaErrors(cudaFree(d_scene));
     checkCudaErrors(cudaFree(d_spheres));
-    //checkCudaErrors(cudaFree(d_randomState));
+    checkCudaErrors(cudaFree(d_randomState));
     checkCudaErrors(cudaFree(framebuffer));
 
     std::cout << "OK" << std::endl;
+    return 0;
 }
