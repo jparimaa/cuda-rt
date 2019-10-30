@@ -3,6 +3,7 @@
 #include "HitableList.h"
 #include "Sphere.h"
 #include "Camera.h"
+#include "Helpers.h"
 
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
@@ -18,44 +19,29 @@ const int c_width = 800;
 const int c_height = 400;
 const int c_numPixels = c_width * c_height;
 const size_t c_framebufferSize = 3 * c_numPixels * sizeof(uint8_t);
-const int c_numRaysPerPixel = 100;
-
-#define checkCudaErrors(val) checkCuda((val), #val, __FILE__, __LINE__)
-void checkCuda(cudaError_t result, char const* const func, const char* const file, int const line)
-{
-    if (result)
-    {
-        std::cerr << "CUDA error = " << static_cast<unsigned int>(result) << " at " << file << ":" << line << " '" << func << "' \n";
-        cudaDeviceReset();
-        exit(1);
-    }
-}
-
-#define RANDVEC3 Vec3(curand_uniform(localRandomState), curand_uniform(localRandomState), curand_uniform(localRandomState))
-
-__device__ Vec3 randomInUnitSphere(curandState* localRandomState)
-{
-    Vec3 p;
-    do
-    {
-        p = 2.0f * RANDVEC3 - Vec3(1.0f, 1.0f, 1.0f);
-    } while (p.squaredLength() >= 1.0f);
-    return p;
-}
+const int c_numRaysPerPixel = 150;
 
 __device__ Vec3 color(const Ray& r, Hitable** d_scene, curandState* localRandomState)
 {
     Ray currentRay = r;
-    float currentAttenuation = 1.0f;
-    int numBounces = 50;
+    Vec3 currentAttenuation(1.0f, 1.0f, 1.0f);
+    int numBounces = 5;
     for (int i = 0; i < numBounces; ++i)
     {
         Hit hit;
         if ((*d_scene)->hit(currentRay, 0.001f, FLT_MAX, hit))
         {
-            Vec3 target = hit.p + hit.normal + randomInUnitSphere(localRandomState);
-            currentAttenuation *= 0.5f;
-            currentRay = Ray(hit.p, target - hit.p);
+            Ray scattered;
+            Vec3 attenuation;
+            if (hit.material->scatter(currentRay, hit, attenuation, scattered, localRandomState))
+            {
+                currentAttenuation *= attenuation;
+                currentRay = scattered;
+            }
+            else
+            {
+                return Vec3(0.0f, 0.0f, 0.0f);
+            }
         }
         else
         {
@@ -113,16 +99,24 @@ __global__ void initRandomState(int width, int height, curandState* d_randomStat
 
 __global__ void createScene(Hitable** d_spheres, Hitable** d_scene, Camera** d_camera)
 {
-    *(d_spheres) = new Sphere(Vec3(0.0f, 0.0f, -1.0f), 0.5f);
-    *(d_spheres + 1) = new Sphere(Vec3(0.0f, -100.5f, -1.0f), 100.0f);
-    *d_scene = new HitableList(d_spheres, 2);
+    // clang-format off
+    d_spheres[0] = new Sphere(Vec3( 0.0f,    0.0f, -1.0f),   0.5f, new Lambertian(Vec3(0.8f, 0.3f, 0.3f)));
+    d_spheres[1] = new Sphere(Vec3( 0.0f, -100.5f, -1.0f), 100.0f, new Lambertian(Vec3(0.8f, 0.8f, 0.0f)));
+    d_spheres[2] = new Sphere(Vec3( 1.0f,    0.0f, -1.0f),   0.5f, new Reflective(Vec3(0.8f, 0.6f, 0.2f), 1.0f));
+    d_spheres[3] = new Sphere(Vec3(-1.0f,    0.0f, -1.0f),   0.5f, new Reflective(Vec3(0.8f, 0.8f, 0.8f), 0.3f));
+    // clang-format on
+
+    *d_scene = new HitableList(d_spheres, 4);
     *d_camera = new Camera();
 }
 
 __global__ void freeScene(Hitable** d_spheres, Hitable** d_scene, Camera** d_camera)
 {
-    delete *(d_spheres);
-    delete *(d_spheres + 1);
+    for (int i = 0; i < 4; ++i)
+    {
+        delete static_cast<Sphere*>(d_spheres[i])->getMaterial();
+        delete d_spheres[i];
+    }
     delete *d_scene;
     delete *d_camera;
 }
@@ -138,9 +132,9 @@ int main()
     checkCudaErrors(cudaMallocManaged((void**)&framebuffer, c_framebufferSize));
 
     Hitable** d_spheres;
-    checkCudaErrors(cudaMalloc((void**)&d_spheres, 2 * sizeof(Hitable*)));
+    checkCudaErrors(cudaMalloc((void**)&d_spheres, 4 * sizeof(Hitable*)));
     Hitable** d_scene;
-    checkCudaErrors(cudaMalloc((void**)&d_scene, sizeof(Hitable*)));
+    checkCudaErrors(cudaMalloc((void**)&d_scene, sizeof(HitableList*)));
     Camera** d_camera;
     checkCudaErrors(cudaMalloc((void**)&d_camera, sizeof(Camera*)));
     createScene<<<1, 1>>>(d_spheres, d_scene, d_camera);
@@ -153,6 +147,7 @@ int main()
     dim3 blocks(c_width / tx + 1, c_height / ty + 1);
     dim3 threads(tx, ty);
 
+    std::cout << "Initializing random state...\n";
     {
         std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
 
@@ -164,6 +159,7 @@ int main()
         std::cout << "Random state initialized (" << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << " ms)" << std::endl;
     }
 
+    std::cout << "Rendering...\n";
     {
         std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
 
