@@ -1,3 +1,3 @@
 # cuda-rt
 
-Ray tracing demos implemented in CUDA and OptiX.
+Ray tracing demo implemented in CUDA
