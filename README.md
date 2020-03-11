@@ -1,3 +1,3 @@
 # cuda-rt
 
-Ray tracing demo implemented in CUDA
+Ray tracing demo implemented in CUDA. See `cuda/` folder.
